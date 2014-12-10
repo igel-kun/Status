@@ -1,0 +1,460 @@
+#include "caterpillar.hpp"
+
+namespace status{
+
+  unordered_map<cat_dynprog_input_pair, cat_dynprog_configs, input_pair_hasher> cat_DP_table;
+  bool cat_DP_table_initialized(false);
+  size_t largest_set_list(0);
+
+  inline bool operator==(const cat_dynprog_input& X, const cat_dynprog_input& Y){
+    return (X.status == Y.status) && (X.subtree == Y.subtree) && (X.influx == Y.influx);
+  }
+  inline bool operator==(const cat_dynprog_input_pair& X, const cat_dynprog_input_pair& Y){
+    return (X.first == Y.first) && (X.second == Y.second);
+  }
+
+  inline vertex* add_new_leaf_with_status(tree* t, vertex* const parent, list<uint>& stati){
+    vertex* result = t->add_vertex(parent);
+    stati.pop_front();
+    return result;
+  }
+
+
+
+  inline void mark_invalid(cat_dynprog_input& input){
+    input = INVALID_INPUT;
+  }
+  inline bool is_invalid(const cat_dynprog_input& input){
+    return input == INVALID_INPUT;
+  }
+  // lower bound on the influx based on number of vertices in the other side
+  inline uint lower_influx_bound(const uint other_subtree){
+    return other_subtree;
+  }
+  // upper bound on the influx based on number of vertices in the other side - when it forms a path - (thx to Euler ^^)
+  inline uint upper_influx_bound(const uint other_subtree){
+    return (other_subtree * (other_subtree + 1)) >> 1;
+  }
+
+  bool is_sane(const cat_dynprog_input& input, const sequence_t& seq, const uint num_vertices){
+    // an input is insane if...
+    DEBUG1(cout << "checking "<<input<<" for sanity..."<<endl);
+    // ... not NO_INPUT
+    if(input == NO_INPUT) return true;
+    // ... its status is not in the sequence
+    if(seq.find(input.status) == seq.end()) return false;
+    DEBUG1(cout << input.status<<" passed containment in sequence"<<endl);
+    // ... its subtree is larger than the graph
+    if(input.subtree > num_vertices) return false;
+    if(input.subtree == 0) return false;
+    DEBUG1(cout << input.subtree<<" passed subtree bounds"<<endl);
+    // ... its influx is less/more than the lower/upper bound based on vertices on the other side
+    const uint other_side(num_vertices - input.subtree);
+    if(input.influx < lower_influx_bound(other_side)) return false;
+    if(input.influx > upper_influx_bound(other_side)) return false;
+    DEBUG1(cout << input.influx<<" passed influx bounds..."<<endl);
+    // ... its influx and subtree must generate a smaller/larger status
+    if(input.influx + lower_influx_bound(input.subtree - 1) > input.status) return false;
+    if(input.influx + upper_influx_bound(input.subtree - 1) < input.status) return false;
+    DEBUG1(cout << input.status<< " passed status bounds..."<<endl);
+    // if we're well within all limits, the input is sane
+    return true;
+  }
+
+  // compute the next input on the path and add it to consumed_stati
+  inline cat_dynprog_input compute_next_input(const cat_dynprog_input& old_input, const uint new_status, const uint leaves){
+    cat_dynprog_input result;
+    result.status = new_status;
+    // compute the subtree using n = n' + l + 1
+    result.subtree = old_input.subtree + leaves + 1;
+    // compute the influx using g' + f' = s', g = g' + n' + l, and g + f = s together yielding f = f' + s - s' - n' - l
+    result.influx = old_input.influx + result.status - old_input.status - old_input.subtree - leaves;
+    return result;
+  }
+
+  // compute the infos of the new question given its leaves and the old inputs
+  // if there are no leaves, then we assume we're looking for the center!
+  cat_dynprog_input compute_inner_input(const cat_dynprog_input& old_input,
+                                        const uint leaves,
+                                        const uint sought_leaf_status,
+                                        const uint num_vertices,
+                                        list<uint>& consumed_stati){
+    cat_dynprog_input result;
+    // we expect to see the corresponding backbone status
+    const uint expected_status( (leaves > 0) ? get_corresponding_backbone_status(sought_leaf_status, num_vertices) : sought_leaf_status);
+    DEBUG2(cout << "walking inwards from "<<old_input<<", expecting to see "<<expected_status<<endl);
+    // if there is NO_INPUT, then create a new input
+    if(old_input == NO_INPUT){
+      // create a new ending of the caterpillar
+      return (cat_dynprog_input){
+        expected_status,          // status
+        leaves + 1,               // subtree
+        expected_status - leaves  // influx
+      };
+    } else {
+      // if we're looking for the backbone status that's outwards, just return the current input
+      if((leaves == 0) && (expected_status >= old_input.status)) return old_input;
+
+      // consume the vertex we're currently at
+      consumed_stati.push_back(old_input.status);
+
+      // compute the next status using s' - s = |V| - 2n'
+      result.status = old_input.status + 2 * old_input.subtree - num_vertices;
+      DEBUG2(cout << "next status: " << result.status << ", expected "<<expected_status<<endl);
+
+      // if the status didn't decrease, we went over the center
+      if(result.status >= old_input.status) return INVALID_INPUT;
+      // if the status decreased below what we're expecing, then the expected status cannot be reached
+      if(result.status < expected_status) return INVALID_INPUT;
+
+      // if the status matches the expected status, then we hit the jackpot :)
+      if(result.status == expected_status) return compute_next_input(old_input, result.status, leaves); else {
+        // if the status doesn't match what we're expecting, then we have to walk further
+        result = compute_next_input(old_input, result.status, 0);
+        return compute_inner_input(result, leaves, sought_leaf_status, num_vertices, consumed_stati);
+      }
+    }
+  }
+
+  
+  
+  // the inverse of the above
+  cat_dynprog_input compute_outer_input(const cat_dynprog_input& old_input, const uint leaves, const uint num_vertices){
+    cat_dynprog_input result;
+    // compute the subtree using n = n' + l + 1
+    result.subtree = old_input.subtree - leaves - 1;
+    // compute the new status using s' - s = |V| - 2n'
+    result.status = old_input.status - 2 * old_input.subtree + num_vertices;
+    // compute the influx using g' + f' = s', g = g' + n' + l, and g + f = s together yielding f = f' + s - s' - n' - l
+    result.influx = old_input.influx - result.status + old_input.status + old_input.subtree + leaves;
+    return result;
+  }
+
+
+  // TODO: use (leaf stati <= exists vertex with n-2 status difference) to save guesses
+  // initialize the dynamic programming table
+  void caterpillar_dynprog_initialize(const sequence_t& stati_seq,
+                                      const list<uint>& stati_list,
+                                      const sequence_t::const_iterator center,
+                                      const uint num_vertices){
+    DEBUG2(cout << "initializing dynprog table"<<endl);
+    assert(center != stati_seq.end());
+    // initialize the set list counter as well
+    largest_set_list = 0;
+    // get the number of occurances of the leaf-status corresponding to the center
+    const uint center_status(center->first);
+
+    // the input stati to be computed
+    cat_dynprog_input_pair inputs;
+    if(center->second == 1){
+      // the center is unique
+
+      cat_dynprog_config config;
+
+      // for each partition of the vertices to the left and right side (by symmetry of the caterpillar, we assume left < right)
+      for(uint subtree_left = 1; subtree_left <= (num_vertices + 1)/2; ++subtree_left){ 
+        // if the left subtree is 0, then the second input is fully determined, go create the DP-table entry
+        inputs.first.status = inputs.second.status = center_status;
+
+        const uint subtree_right(num_vertices - subtree_left + 1);
+        inputs.first.subtree = subtree_left;
+        inputs.second.subtree = subtree_right;
+        // influx to the right must be at least subtree_left-1
+        DEBUG2(cout << "range for influx_right: "<<subtree_left-1<<"-"<<center_status-(subtree_right -1)<<endl);
+        // for each partition of influxes and subgraph sizes, compute respective inputs (the root is counted twice)
+        for(uint influx_right = subtree_left - 1; influx_right + (subtree_right - 1)<= center_status; ++influx_right){
+          const uint influx_left(center_status - influx_right);
+          inputs.second.influx = influx_right;
+          inputs.first.influx = influx_left;
+
+          // TODO: some of the inputs are still not sane (according to is_sane) - generate less!
+          config.inner_cat = new tree();
+          vertex* root = config.inner_cat->add_vertex(NULL);
+          config.docks = make_pair(root, root);
+
+          // finally, create a cat_DP_table entry with inputs and all possible status combinations on each side
+          cat_dynprog_configs& confs(cat_DP_table[inputs]);
+          confs.push_back(config);
+          DEBUG2(cout << "guess: subtree_left="<<subtree_left<<" of "<<num_vertices<<" influx_left="<<influx_left<<"\t\tT"<<inputs<<"="<<confs<<" now"<<endl);
+        }
+      }
+    } else {
+      // the center is not unique
+      if(center->second > 2) FAIL("detected "<<center->second<<">2 center vertices");
+      if(num_vertices & 1) FAIL("2 centers and odd number of vertices, this is not right...");
+
+      // both sides get the same status and number of vertices by n - 2n_1 = s - s = n - 2n_2
+      inputs.first.status = inputs.second.status = center_status;
+      inputs.first.subtree = inputs.second.subtree = num_vertices>>1;
+
+      // compute attachments according to decisions for the backbone
+      cat_dynprog_config config;
+
+      // for each reasonable partition of influxes and leaves, compute respective inputs
+      for(uint influx_left = 2*inputs.second.subtree - 1; influx_left + inputs.first.subtree - 1 <= center_status; ++influx_left){
+        inputs.first.influx = influx_left;
+        // use formulars f_2 + g_2 + l_2 = s  and  f_1 = g_2 +  l_2 + n_2
+        inputs.second.influx = center_status + inputs.second.subtree - influx_left;
+
+        config.inner_cat = new tree();
+        vertex* root1 = config.inner_cat->add_vertex(NULL);
+        vertex* root2 = config.inner_cat->add_vertex(root1);
+        config.docks = make_pair(root1, root2);
+
+        // finally, create a cat_DP_table entry with inputs and all possible status combinations on each side
+        cat_dynprog_configs& confs(cat_DP_table[inputs]);
+        confs.push_back(config);
+        DEBUG2(cout << "guess: influx_left="<<influx_left<<"\t\tT"<<inputs<<"="<<confs<<" now"<<endl);
+      }
+    }
+    // finally mark table as initialized
+    cat_DP_table_initialized = true;
+  }
+
+  void caterpillar_dynprog_initialize(const sequence_t& stati_seq,
+                                      const list<uint>& stati_list,
+                                      const uint center_status,
+                                      const uint num_vertices){
+    const sequence_t::const_iterator center(stati_seq.find(center_status));
+    caterpillar_dynprog_initialize(stati_seq, stati_list, center, num_vertices);
+  }
+  void caterpillar_dynprog_initialize(const sequence_t& stati_seq, const list<uint>& stati_list){
+    // if we're not given the min status, just find it in stati_seq
+    sequence_t::const_iterator min_status = stati_seq.begin();
+    uint num_vertices(0);
+
+    for(sequence_t::const_iterator i = stati_seq.begin(); i != stati_seq.end(); ++i){
+      if(min_status->first > i->first) min_status = i;
+      num_vertices += i->second;
+    }
+    // and call the other initializer
+    caterpillar_dynprog_initialize(stati_seq, stati_list, min_status, num_vertices);
+  }
+
+  // update one half of a config given by a recursive call of the dynamic programming
+  // return whether the forced stati are supported by the attachment
+  bool update_config_part(tree*& t,
+                          vertex*& dock,
+                          attachment_t& attachment,
+                          const uint input_status,
+                          const list<uint>& consumed_stati,
+                          const uint backbone_status,
+                          const uint leaves,
+                          const uint center_status){
+    // update the internal caterpillar t & the docking vertices if there are leaves
+    DEBUG1(cout << "adding "<<leaves<<" leaves and backbone vertices with stati "<<consumed_stati<<" to tree @"<<t<<":"<<endl<< *t<<endl);
+    // add leaves to the last dock
+    for(uint i = 0; i < leaves; ++i) t->add_vertex(dock);
+    // add vertices we had to skip over to reach it + 1  and update the dock,
+    // unless it's the center vertex, we already added him in the initialization
+    for(uint i: consumed_stati) if(i != center_status) dock = t->add_vertex(dock);
+
+
+    DEBUG1(cout << "yielded "<<endl<< *t<<endl);
+    // update attachment:
+    // 1. consumed_stati consume backbone vertices
+    for(uint con: consumed_stati){
+      DEBUG2(cout << "removing "<<con<<" from attachment "<<attachment<< endl);
+      const attachment_t::iterator i(attachment.find(con));
+      // if the backbone status cannot be used outside the inner caterpillar, return failure
+      if(i == attachment.end()) return false;
+      attachment.erase(i);
+    }
+    // 2. if current status is on the outer backbone, add this occurance to the attachment
+    if(backbone_status > input_status) attachment.insert(backbone_status);
+
+    return true;
+  }
+
+  // update a config given by a recursive call of the dynamic programming
+  bool update_config(cat_dynprog_config& c,
+                     const cat_dynprog_input_pair& inputs,
+                     const pair<list<uint>, list<uint> >& consumed_stati,
+                     const pair<uint, uint> backbone_stati,
+                     const pair<uint, uint>& leaves,
+                     const uint center_status){
+    return update_config_part(c.inner_cat,
+                       c.docks.first,
+                       c.attachments,
+                       inputs.first.status,
+                       consumed_stati.first,
+                       backbone_stati.first,
+                       leaves.first,
+                       center_status)
+      &&
+      update_config_part(c.inner_cat,
+                       c.docks.second,
+                       c.attachments,
+                       inputs.first.status,
+                       consumed_stati.second,
+                       backbone_stati.second,
+                       leaves.second,
+                       center_status);
+  }
+
+
+  // forward-declare dynamic programming
+  cat_dynprog_configs caterpillar_dynprog(const sequence_t& stati_seq,
+                                          const list<uint>& stati_list,
+                                          const list<uint>::const_iterator current_status,
+                                          const cat_dynprog_input_pair inputs);
+
+
+  cat_dynprog_configs dynprog_recurse_for_guess(const sequence_t& stati_seq,
+                                                const list<uint>& stati_list,
+                                                const list<uint>::const_iterator current_status,
+                                                const cat_dynprog_input_pair& inputs,
+                                                const pair<bool, bool> backbone,
+                                                const pair<uint, uint> leaves,
+                                                const uint num_vertices){
+    cat_dynprog_input_pair new_inputs(inputs);
+    list<uint>::const_iterator previous_status = current_status; --previous_status;
+    const uint center_status(stati_list.front());
+    
+    // walk inwards to get the new input values, producing stati that are forced on the way
+    pair<list<uint>, list<uint> > consumed_stati;
+
+    // walk inwards unless we're only on the outer backbone
+    if(leaves.first || (*current_status <= inputs.first.status))
+      new_inputs.first  = compute_inner_input(inputs.first,  leaves.first,  *current_status,  num_vertices, consumed_stati.first);
+    
+    if(leaves.second || (*current_status <= inputs.second.status))
+      new_inputs.second = compute_inner_input(inputs.second, leaves.second, *current_status, num_vertices, consumed_stati.second);
+
+    DEBUG2(cout<<"status "<<*current_status<<": new inputs="<<new_inputs<<" forcing "<<consumed_stati<<endl);
+
+    // make sure the inputs are sane
+    if(is_sane(new_inputs.first, stati_seq, num_vertices) && is_sane(new_inputs.second, stati_seq, num_vertices)){
+      // recursive call to the previous layer of the dynamic programming table
+      cat_dynprog_configs tmp(caterpillar_dynprog(stati_seq, stati_list, previous_status, new_inputs));
+
+      // remove all configurations that do not support our consumed_stati
+      for(cat_dynprog_configs::iterator c = tmp.begin(); c != tmp.end();){
+        if(update_config(*c, inputs, consumed_stati, backbone * *current_status, leaves, center_status)){
+          DEBUG2(cout << "status "<<*current_status<<": "<<c->attachments<<" supports "<<consumed_stati<<endl);
+          // if we're at the top level (indicated by input NO_INPUT,NO_INPUT), the fixed part of both configs should be empty
+          if(inputs == cat_dynprog_input_pair(NO_INPUT, NO_INPUT)){
+            if(! c->attachments.empty()){
+              DEBUG2(cout << "status "<<*current_status<<": found fixed elements in "<<c->attachments<<" on top level, discarding"<<endl);
+              c = tmp.erase(c);
+            } else ++c;
+          } else ++c;
+        } else {
+          DEBUG2(cout << "status "<<*current_status<<": "<<c->attachments<<" does not support "<<consumed_stati<<endl);
+          // if the forced stati don't match the lists supported by the dynamic table entries, then erase this set-list
+          c = tmp.erase(c);
+        }
+      }
+      return tmp;
+    } else return cat_dynprog_configs();
+  }
+
+
+  // do the dynamic programming
+  cat_dynprog_configs caterpillar_dynprog(const sequence_t& stati_seq,
+                                          const list<uint>& stati_list,
+                                          const list<uint>::const_iterator current_status,
+                                          const cat_dynprog_input_pair inputs)
+  {
+    // the main goal is to devide the occurances of the current status into leaves and backbone vertices on either side
+
+    // if cat_DP_table has not yet been initialized, do so first
+    if(!cat_DP_table_initialized) caterpillar_dynprog_initialize(stati_seq, stati_list);
+    // if it's in the DP table, use it
+    { const auto lookup(cat_DP_table.find(inputs));
+      if(lookup != cat_DP_table.end()){
+        DEBUG2(cout << "=== found "<<inputs<<" with "<<lookup->second.size()<<" entries in the table:"<<endl);
+        return lookup->second;
+    }}
+    DEBUG2(cout << "status "<<*current_status<<": "<< inputs << " not found in the table, computing..."<<endl);
+
+    // assume current_status is valid
+    if(current_status == stati_list.end()) return cat_dynprog_configs();
+
+    // prepare container to hold result
+    cat_dynprog_configs result;
+
+    // get the number of vertices
+    const uint num_vertices(get_num_vertices(stati_seq));
+    // get the center status
+    const uint center_status(stati_list.front());
+
+    // if we're at the center, then we don't need to guess; it's always backbone=(1,1)
+    if(*current_status == center_status){
+      result = dynprog_recurse_for_guess(stati_seq, stati_list, current_status, inputs, make_pair(1,1), make_pair(0,0), num_vertices);
+    } else {
+      // get the multiplicity of the current status 
+      const uint current_number(stati_seq.at(*current_status));
+
+      // branch into partitions of the vertices of current status:
+      // backbone left? backbone right? #leaves left? #leaves right?
+      pair<unsigned char, unsigned char> backbone;
+      pair<uint, uint> leaves;
+
+
+      for(backbone.first = 0; backbone.first <= min(1U, current_number); ++backbone.first)
+        for(backbone.second = 0; backbone.second <= min(1U, current_number - backbone.first); ++backbone.second){
+          uint current_number_leaves = current_number - backbone.first - backbone.second;
+          for(leaves.first = 0; leaves.first <= current_number_leaves; ++leaves.first){
+            leaves.second = current_number_leaves - leaves.first;
+            DEBUG2(cout << "status "<<*current_status<<": backbone="<<(pair<bool, bool>)backbone<<" leaves="<<leaves<<endl);
+
+            result.splice(result.begin(), dynprog_recurse_for_guess(stati_seq, stati_list, current_status, inputs, backbone, leaves, num_vertices));
+          }
+        }
+    }
+    DEBUG2(cout << "status "<<*current_status<<": results for inputs "<<inputs<<" augmented to "<<result<<endl);
+
+    // add the result to the dynamic programming table
+    cat_dynprog_configs& entry = cat_DP_table[inputs];
+    entry.splice(entry.begin(), result);
+
+    
+    
+    // keep track of list sizes
+    largest_set_list = max(largest_set_list, result.size());
+
+    return result;
+  }
+
+  tree* stati_to_caterpillar(const sequence_t& s){
+    // we rather work with a (sorted) list of stati
+    list<uint> stati(get_occuring_stati(s));
+    stati.sort();
+
+    DEBUG2(cout << "stati: "<<stati<<endl);
+    const uint num_vertices(get_num_vertices(s));
+
+    // let's say we have at least two stati
+    assert(stati.size() > 1);
+
+    // construct the inputs
+    cat_dynprog_input_pair inputs;
+    pair<uint, uint> leaves;
+
+    const uint max_status(*stati.rbegin());
+    const uint backbone_status(get_corresponding_backbone_status(max_status, num_vertices));
+    const uint num_leaves(s.at(max_status));
+
+    DEBUG2(cout << "info: max="<<max_status<<" |V|="<<num_vertices<<" bb="<<backbone_status<<" leaves="<<num_leaves<<endl);
+
+    cat_dynprog_configs confs(caterpillar_dynprog(s, stati, --stati.end(), cat_dynprog_input_pair(NO_INPUT, NO_INPUT)));
+    // and, if successfull, return the first possible tree
+    if(!confs.empty()) return confs.begin()->inner_cat; else return NULL;
+  }
+
+  size_t get_set_list_max(){ return largest_set_list; }
+}
+
+std::ostream& operator<<(std::ostream& os, const status::cat_dynprog_input& i){
+  return os << '['<<i.status<<' '<<i.subtree<<' '<<i.influx<<']';
+}
+
+
+ostream& operator<<(ostream& os, const status::cat_dynprog_config& c){
+  os << c.attachments;
+  DEBUG1(os<< " tree @"<<c.inner_cat);
+  return os;
+}
+
+
